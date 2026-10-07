@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Porter</title>
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <header id="drag">
+      <div class="brand">
+        <span class="logo">P</span>
+        <span class="title">Porter</span>
+      </div>
+      <button id="close" type="button" title="Hide">×</button>
+    </header>
+
+    <main>
+      <label class="field">
+        <span class="field-label">URL</span>
+        <input id="url" type="url" placeholder="https://app.example.com" spellcheck="false" />
+      </label>
+
+      <div class="row">
+        <label class="field">
+          <span class="field-label">Browser</span>
+          <select id="browser"></select>
+        </label>
+        <label class="field">
+          <span class="field-label">Profile</span>
+          <select id="profile"></select>
+        </label>
+      </div>
+
+      <button id="launch" type="button" class="launch">
+        Launch <span class="arrow">→</span>
+      </button>
+
+      <div class="manage">
+        <button id="add" type="button">+ Add browser</button>
+        <button id="remove" type="button">Remove</button>
+      </div>
+
+      <section class="presets">
+        <h2>Shortcuts</h2>
+        <ul id="presets"></ul>
+        <div class="save">
+          <input id="label" type="text" placeholder="Name this shortcut…" maxlength="40" />
+          <button id="save" type="button">Save</button>
+        </div>
+      </section>
+    </main>
+
+    <p id="error" hidden></p>
+    <script src="app.js"></script>
+  </body>
+</html>
