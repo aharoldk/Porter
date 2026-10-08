@@ -15,38 +15,94 @@
       <button id="close" type="button" title="Hide">×</button>
     </header>
 
+    <nav class="tabs">
+      <button class="tab active" type="button" data-tab="launch">Launch</button>
+      <button class="tab" type="button" data-tab="routes">Routes</button>
+      <button class="tab" type="button" data-tab="config">Config</button>
+    </nav>
+
     <main>
-      <label class="field">
-        <span class="field-label">URL</span>
-        <input id="url" type="url" placeholder="https://app.example.com" spellcheck="false" />
-      </label>
-
-      <div class="row">
+      <section class="panel" id="panel-launch">
         <label class="field">
-          <span class="field-label">Browser</span>
-          <select id="browser"></select>
+          <span class="field-label">URL</span>
+          <input id="url" type="url" placeholder="https://app.example.com" spellcheck="false" />
         </label>
+
+        <div class="row">
+          <label class="field">
+            <span class="field-label">Browser</span>
+            <select id="browser"></select>
+          </label>
+          <label class="field">
+            <span class="field-label">Profile</span>
+            <select id="profile"></select>
+          </label>
+        </div>
+
+        <button id="launch" type="button" class="launch">
+          Launch <span class="arrow">→</span>
+        </button>
+      </section>
+
+      <section class="panel" id="panel-routes" hidden>
+        <h2>New route</h2>
         <label class="field">
-          <span class="field-label">Profile</span>
-          <select id="profile"></select>
+          <span class="field-label">URL</span>
+          <input id="route-url" type="url" placeholder="https://github.com" spellcheck="false" />
         </label>
-      </div>
 
-      <button id="launch" type="button" class="launch">
-        Launch <span class="arrow">→</span>
-      </button>
+        <div class="row">
+          <label class="field">
+            <span class="field-label">Browser</span>
+            <select id="route-browser"></select>
+          </label>
+          <label class="field">
+            <span class="field-label">Profile</span>
+            <select id="route-profile"></select>
+          </label>
+        </div>
 
-      <div class="manage">
-        <button id="add" type="button">+ Add browser</button>
-        <button id="remove" type="button">Remove</button>
-      </div>
-
-      <section class="presets">
-        <h2>Shortcuts</h2>
-        <ul id="presets"></ul>
         <div class="save">
           <input id="label" type="text" placeholder="Name this shortcut…" maxlength="40" />
           <button id="save" type="button">Save</button>
+        </div>
+
+        <section class="presets">
+          <h2>Saved routes</h2>
+          <p class="hint">Links matching a route open in its browser, whatever is picked in Launch.</p>
+          <ul id="presets"></ul>
+        </section>
+      </section>
+
+      <section class="panel" id="panel-config" hidden>
+        <div class="block">
+          <h2>Default browser</h2>
+          <p class="hint">Used when a URL matches no route.</p>
+          <div class="row">
+            <label class="field">
+              <span class="field-label">Browser</span>
+              <select id="default-browser"></select>
+            </label>
+            <label class="field">
+              <span class="field-label">Profile</span>
+              <select id="default-profile"></select>
+            </label>
+          </div>
+        </div>
+
+        <div class="block">
+          <h2>Browsers</h2>
+          <ul id="config-browsers"></ul>
+          <div class="manage">
+            <button id="add" type="button">+ Add browser</button>
+          </div>
+        </div>
+
+        <div class="block">
+          <h2>System default</h2>
+          <p class="hint" id="default-status">Checking…</p>
+          <button id="install-default" type="button" class="wide">Make Porter the default browser</button>
+          <pre id="install-output" hidden></pre>
         </div>
       </section>
     </main>

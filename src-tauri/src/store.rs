@@ -22,6 +22,10 @@ pub struct Store {
     pub browsers: Vec<Browser>,
     #[serde(default)]
     pub presets: Vec<Preset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_browser: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
 }
 
 pub fn config_file(dir: &Path) -> PathBuf {

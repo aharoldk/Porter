@@ -31,6 +31,8 @@ struct Snapshot {
     browsers: Vec<Browser>,
     presets: Vec<Preset>,
     profiles: Vec<Profile>,
+    default_browser: Option<String>,
+    default_profile: Option<String>,
 }
 
 #[tauri::command]
@@ -40,6 +42,8 @@ fn get_state(state: State<AppState>) -> Snapshot {
         browsers: store.browsers.clone(),
         presets: store.presets.clone(),
         profiles: Vec::new(),
+        default_browser: store.default_browser.clone(),
+        default_profile: store.default_profile.clone(),
     }
 }
 
@@ -100,7 +104,125 @@ fn remove_browser(state: State<AppState>, id: String) -> Result<(), String> {
     let mut store = state.store.lock().expect("store");
     store.browsers.retain(|browser| browser.id != id);
     store.presets.retain(|preset| preset.browser_id != id);
+    if store.default_browser.as_deref() == Some(id.as_str()) {
+        store.default_browser = None;
+        store.default_profile = None;
+    }
     save(&state.path, &store)
+}
+
+#[tauri::command]
+fn set_default_browser(
+    state: State<AppState>,
+    browser_id: Option<String>,
+    profile: Option<String>,
+) -> Result<(), String> {
+    let browser_id = browser_id.filter(|id| !id.is_empty());
+    let profile = profile.filter(|value| !value.trim().is_empty());
+    let mut store = state.store.lock().expect("store");
+    if let Some(id) = &browser_id {
+        if !store.browsers.iter().any(|browser| &browser.id == id) {
+            return Err("That browser is gone".into());
+        }
+    }
+    store.default_browser = browser_id;
+    store.default_profile = if store.default_browser.is_some() {
+        profile
+    } else {
+        None
+    };
+    save(&state.path, &store)
+}
+
+fn find_install_script() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("install-default-browser.sh"));
+            if let Some(root) = dir.parent() {
+                candidates.push(root.join("install-default-browser.sh"));
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("install-default-browser.sh"));
+        candidates.push(cwd.join("..").join("install-default-browser.sh"));
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../install-default-browser.sh"),
+    );
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[tauri::command]
+fn install_default_browser() -> Result<String, String> {
+    let script =
+        find_install_script().ok_or("install-default-browser.sh was not found near Porter")?;
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let output = std::process::Command::new("bash")
+        .arg(&script)
+        .arg(&exe)
+        .output()
+        .map_err(|err| format!("Could not run {}: {}", script.display(), err))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&stderr);
+    }
+    if !output.status.success() {
+        return Err(if text.is_empty() {
+            format!("Script failed with status {}", output.status)
+        } else {
+            text
+        });
+    }
+    Ok(text)
+}
+
+#[tauri::command]
+fn default_browser_status() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("xdg-settings")
+            .args(["get", "default-web-browser"])
+            .output()
+            .ok()?;
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if value.is_empty() {
+            return Some(false);
+        }
+        Some(value == "porter.desktop")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("defaults")
+            .args([
+                "read",
+                "com.apple.LaunchServices",
+                "LSSetDefaultHandlerForURLScheme",
+                "https",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return Some(false);
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if value.is_empty() {
+            return Some(false);
+        }
+        let exe = std::env::current_exe().ok()?;
+        let exe = exe.canonicalize().unwrap_or(exe);
+        Some(value == exe.to_string_lossy())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 #[tauri::command]
@@ -262,6 +384,54 @@ fn take_pending_url(state: State<AppState>) -> Option<String> {
     state.pending_url.lock().expect("pending_url").take()
 }
 
+struct LaunchChoice {
+    browser: Browser,
+    profile: Option<String>,
+    route_label: Option<String>,
+}
+
+fn resolve_launch(
+    store: &Store,
+    url: &str,
+    picked_browser: Option<String>,
+    picked_profile: Option<String>,
+) -> Option<LaunchChoice> {
+    let picked_browser = picked_browser.filter(|id| !id.is_empty());
+    let picked_profile = picked_profile.filter(|value| !value.trim().is_empty());
+    let find = |id: &str| store.browsers.iter().find(|browser| browser.id == id);
+
+    if let Some(route) = find_route(&store.presets, url) {
+        let browser = find(&route.browser_id)?;
+        return Some(LaunchChoice {
+            browser: browser.clone(),
+            profile: route.profile.clone().or(picked_profile),
+            route_label: Some(route.label.clone()),
+        });
+    }
+    if let Some(default_id) = store
+        .default_browser
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    {
+        if let Some(browser) = find(default_id) {
+            return Some(LaunchChoice {
+                browser: browser.clone(),
+                profile: store.default_profile.clone().or(picked_profile),
+                route_label: None,
+            });
+        }
+    }
+    picked_browser
+        .as_deref()
+        .and_then(find)
+        .or_else(|| store.browsers.first())
+        .map(|browser| LaunchChoice {
+            browser: browser.clone(),
+            profile: picked_profile,
+            route_label: None,
+        })
+}
+
 #[tauri::command]
 fn auto_launch_url(
     state: State<AppState>,
@@ -275,33 +445,17 @@ fn auto_launch_url(
     }
     state.pending_url.lock().expect("pending_url").take();
     let store = state.store.lock().expect("store");
-
-    let route = find_route(&store.presets, &url);
-    let picked_browser = browser_id.filter(|id| !id.is_empty());
-    let picked_profile = profile.filter(|p| !p.trim().is_empty());
-
-    let chosen_browser_id = route
-        .map(|p| p.browser_id.clone())
-        .or(picked_browser)
-        .or_else(|| store.browsers.first().map(|b| b.id.clone()));
-    let chosen_profile = route
-        .and_then(|p| p.profile.clone())
-        .or(picked_profile);
-
-    let browser = chosen_browser_id
-        .and_then(|id| store.browsers.iter().find(|b| b.id == id).cloned());
-    let route_label = route.map(|r| r.label.clone());
+    let choice = resolve_launch(&store, &url, browser_id, profile).ok_or("No browser selected")?;
     drop(store);
 
-    let browser = browser.ok_or("No browser selected")?;
     eprintln!(
         "[auto_launch] url={} route={} browser={} profile={:?}",
         url,
-        route_label.as_deref().unwrap_or("-"),
-        browser.name,
-        chosen_profile
+        choice.route_label.as_deref().unwrap_or("-"),
+        choice.browser.name,
+        choice.profile
     );
-    let result = launch(&browser, chosen_profile.as_deref(), &url);
+    let result = launch(&choice.browser, choice.profile.as_deref(), &url);
     eprintln!("[auto_launch] result={:?}", result);
     result
 }
@@ -387,12 +541,15 @@ pub fn run() {
             list_profiles,
             add_browser,
             remove_browser,
+            set_default_browser,
+            install_default_browser,
+            default_browser_status,
             save_preset,
             delete_preset,
             launch_url,
             launch_preset,
             take_pending_url,
-            auto_launch_url,     // <-- FIXED
+            auto_launch_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running porter");
@@ -446,5 +603,94 @@ mod route_tests {
         let presets = vec![preset("https://github.com")];
         assert!(find_route(&presets, "https://github.com/aharoldk/keel").is_some());
         assert!(find_route(&presets, "https://gitlab.com").is_none());
+    }
+
+    fn browser(id: &str, name: &str) -> Browser {
+        Browser {
+            id: id.into(),
+            name: name.into(),
+            kind: browsers::BrowserKind::Chromium,
+            executable: "/bin/true".into(),
+            user_data_dir: None,
+        }
+    }
+
+    fn store(browsers: Vec<Browser>, presets: Vec<Preset>) -> Store {
+        Store {
+            browsers,
+            presets,
+            default_browser: None,
+            default_profile: None,
+        }
+    }
+
+    #[test]
+    fn default_browser_used_when_no_route() {
+        let mut store = store(
+            vec![browser("b1", "Chrome"), browser("b2", "Firefox")],
+            vec![],
+        );
+        store.default_browser = Some("b2".into());
+        store.default_profile = Some("work".into());
+        let choice = resolve_launch(&store, "https://example.com", Some("b1".into()), None)
+            .expect("a browser");
+        assert_eq!(choice.browser.id, "b2");
+        assert_eq!(choice.profile.as_deref(), Some("work"));
+        assert!(choice.route_label.is_none());
+    }
+
+    #[test]
+    fn route_wins_over_default_browser() {
+        let mut store = store(
+            vec![browser("b1", "Chrome"), browser("b2", "Firefox")],
+            vec![Preset {
+                id: "p".into(),
+                label: "GitLab".into(),
+                url: "https://gitlab.com".into(),
+                browser_id: "b1".into(),
+                profile: None,
+            }],
+        );
+        store.default_browser = Some("b2".into());
+        let choice = resolve_launch(
+            &store,
+            "https://gitlab.com/group/repo",
+            Some("b2".into()),
+            None,
+        )
+        .expect("a browser");
+        assert_eq!(choice.browser.id, "b1");
+        assert_eq!(choice.route_label.as_deref(), Some("GitLab"));
+    }
+
+    #[test]
+    fn picked_browser_used_when_no_default() {
+        let store = store(
+            vec![browser("b1", "Chrome"), browser("b2", "Firefox")],
+            vec![],
+        );
+        let choice = resolve_launch(&store, "https://example.com", Some("b2".into()), None)
+            .expect("a browser");
+        assert_eq!(choice.browser.id, "b2");
+        assert!(choice.route_label.is_none());
+    }
+
+    #[test]
+    fn first_browser_is_last_resort() {
+        let store = store(vec![browser("b1", "Chrome")], vec![]);
+        let choice = resolve_launch(&store, "https://example.com", None, None).expect("a browser");
+        assert_eq!(choice.browser.id, "b1");
+    }
+
+    #[test]
+    fn no_browser_means_no_choice() {
+        let store = store(vec![], vec![]);
+        assert!(resolve_launch(&store, "https://example.com", None, None).is_none());
+    }
+
+    #[test]
+    fn finds_install_script() {
+        let script = find_install_script().expect("install-default-browser.sh should be found");
+        assert!(script.ends_with("install-default-browser.sh"));
     }
 }
