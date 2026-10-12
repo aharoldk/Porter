@@ -169,6 +169,7 @@ fn bundled_icon(app: &AppHandle) -> Option<PathBuf> {
     icon.is_file().then_some(icon)
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 fn find_install_script_from(resource: Option<PathBuf>) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = resource.into_iter().collect();
     if let Ok(exe) = std::env::current_exe() {
@@ -190,6 +191,7 @@ fn find_install_script_from(resource: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 #[tauri::command]
+#[cfg_attr(target_os = "macos", allow(unused_variables))]
 fn install_default_browser(app: AppHandle) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {

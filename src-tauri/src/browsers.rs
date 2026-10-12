@@ -619,13 +619,19 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn dummy_exe(name: &str) -> String {
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
     #[test]
     fn chromium_launch_args() {
         let browser = Browser {
             id: "1".into(),
             name: "Helium".into(),
             kind: BrowserKind::Chromium,
-            executable: "/bin/true".into(),
+            executable: dummy_exe("porter-dummy-chromium"),
             user_data_dir: Some("/tmp/helium".into()),
         };
         let plan = plan(&browser, Some("Profile 1"), "https://example.com").unwrap();
@@ -637,6 +643,7 @@ mod tests {
                 "https://example.com",
             ]
         );
+        assert_eq!(plan.program, browser.executable);
     }
 
     #[test]
@@ -645,7 +652,7 @@ mod tests {
             id: "1".into(),
             name: "Firefox".into(),
             kind: BrowserKind::Firefox,
-            executable: "/bin/true".into(),
+            executable: dummy_exe("porter-dummy-firefox"),
             user_data_dir: Some("/tmp/ff".into()),
         };
         let plan = plan(&browser, Some("Work"), "https://example.com").unwrap();
@@ -653,6 +660,7 @@ mod tests {
             plan.args,
             vec!["-P", "Work", "-new-instance", "https://example.com"]
         );
+        assert_eq!(plan.program, browser.executable);
     }
 
     #[test]
