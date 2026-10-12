@@ -1,17 +1,21 @@
 mod browsers;
+#[cfg(target_os = "macos")]
+mod macos_default;
 mod store;
 
 use browsers::{infer_kind, launch, pretty_name, profiles_in, Browser, Profile};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use store::{config_file, load, new_id, save, Preset, Store};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State, WebviewWindow,
 };
+#[cfg(not(target_os = "macos"))]
+use tauri::path::BaseDirectory;
 
 struct AppState {
     path: PathBuf,
@@ -19,10 +23,22 @@ struct AppState {
     pending_url: Mutex<Option<String>>,
 }
 
+/// Locks a mutex, recovering the inner value if a previous holder panicked.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Porter understands these URL shapes as command line arguments:
+/// real http(s) links plus the `github:`/`gh:` shortcuts.
+fn is_url_arg(arg: &str) -> bool {
+    arg.starts_with("http://")
+        || arg.starts_with("https://")
+        || arg.starts_with("github:")
+        || arg.starts_with("gh:")
+}
+
 fn url_arg() -> Option<String> {
-    std::env::args()
-        .skip(1)
-        .find(|arg| arg.starts_with("http://") || arg.starts_with("https://"))
+    std::env::args().skip(1).find(|arg| is_url_arg(arg))
 }
 
 #[derive(Serialize)]
@@ -30,18 +46,16 @@ fn url_arg() -> Option<String> {
 struct Snapshot {
     browsers: Vec<Browser>,
     presets: Vec<Preset>,
-    profiles: Vec<Profile>,
     default_browser: Option<String>,
     default_profile: Option<String>,
 }
 
 #[tauri::command]
 fn get_state(state: State<AppState>) -> Snapshot {
-    let store = state.store.lock().expect("store");
+    let store = lock(&state.store);
     Snapshot {
         browsers: store.browsers.clone(),
         presets: store.presets.clone(),
-        profiles: Vec::new(),
         default_browser: store.default_browser.clone(),
         default_profile: store.default_profile.clone(),
     }
@@ -49,7 +63,7 @@ fn get_state(state: State<AppState>) -> Snapshot {
 
 #[tauri::command]
 fn list_profiles(state: State<AppState>, browser_id: String) -> Vec<Profile> {
-    let store = state.store.lock().expect("store");
+    let store = lock(&state.store);
     store
         .browsers
         .iter()
@@ -85,7 +99,7 @@ fn add_browser(state: State<AppState>) -> Result<Option<Browser>, String> {
         executable: executable.to_string_lossy().into_owned(),
         user_data_dir: user_data_dir.map(|dir| dir.to_string_lossy().into_owned()),
     };
-    let mut store = state.store.lock().expect("store");
+    let mut store = lock(&state.store);
     store.browsers.push(browser.clone());
     save(&state.path, &store)?;
     Ok(Some(browser))
@@ -101,7 +115,7 @@ fn marker_exists(dir: &Path, kind: browsers::BrowserKind) -> bool {
 
 #[tauri::command]
 fn remove_browser(state: State<AppState>, id: String) -> Result<(), String> {
-    let mut store = state.store.lock().expect("store");
+    let mut store = lock(&state.store);
     store.browsers.retain(|browser| browser.id != id);
     store.presets.retain(|preset| preset.browser_id != id);
     if store.default_browser.as_deref() == Some(id.as_str()) {
@@ -119,7 +133,7 @@ fn set_default_browser(
 ) -> Result<(), String> {
     let browser_id = browser_id.filter(|id| !id.is_empty());
     let profile = profile.filter(|value| !value.trim().is_empty());
-    let mut store = state.store.lock().expect("store");
+    let mut store = lock(&state.store);
     if let Some(id) = &browser_id {
         if !store.browsers.iter().any(|browser| &browser.id == id) {
             return Err("That browser is gone".into());
@@ -134,8 +148,29 @@ fn set_default_browser(
     save(&state.path, &store)
 }
 
-fn find_install_script() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
+/// Locates the bundled install script, preferring the app's resource
+/// directory (packaged builds) and falling back to repo-relative locations
+/// (development runs).
+#[cfg(not(target_os = "macos"))]
+fn find_install_script(app: &AppHandle) -> Option<PathBuf> {
+    let resource = app
+        .path()
+        .resolve("install-default-browser.sh", BaseDirectory::Resource)
+        .ok();
+    find_install_script_from(resource)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bundled_icon(app: &AppHandle) -> Option<PathBuf> {
+    let icon = app
+        .path()
+        .resolve("porter-icon.png", BaseDirectory::Resource)
+        .ok()?;
+    icon.is_file().then_some(icon)
+}
+
+fn find_install_script_from(resource: Option<PathBuf>) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = resource.into_iter().collect();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("install-default-browser.sh"));
@@ -155,32 +190,48 @@ fn find_install_script() -> Option<PathBuf> {
 }
 
 #[tauri::command]
-fn install_default_browser() -> Result<String, String> {
-    let script =
-        find_install_script().ok_or("install-default-browser.sh was not found near Porter")?;
-    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
-    let exe = exe.canonicalize().unwrap_or(exe);
-    let output = std::process::Command::new("bash")
-        .arg(&script)
-        .arg(&exe)
-        .output()
-        .map_err(|err| format!("Could not run {}: {}", script.display(), err))?;
-    let mut text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !stderr.is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
+fn install_default_browser(app: AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_default::set_default("http")?;
+        macos_default::set_default("https")?;
+        return Ok(
+            "Porter is now the default browser on macOS. If links still open elsewhere, \
+             check System Settings > Desktop & Dock."
+                .into(),
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let script =
+            find_install_script(&app).ok_or("install-default-browser.sh was not found near Porter")?;
+        let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+        let exe = exe.canonicalize().unwrap_or(exe);
+        let mut command = std::process::Command::new("bash");
+        command.arg(&script).arg(&exe);
+        if let Some(icon) = bundled_icon(&app) {
+            command.arg(icon);
         }
-        text.push_str(&stderr);
+        let output = command
+            .output()
+            .map_err(|err| format!("Could not run {}: {}", script.display(), err))?;
+        let mut text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&stderr);
+        }
+        if !output.status.success() {
+            return Err(if text.is_empty() {
+                format!("Script failed with status {}", output.status)
+            } else {
+                text
+            });
+        }
+        Ok(text)
     }
-    if !output.status.success() {
-        return Err(if text.is_empty() {
-            format!("Script failed with status {}", output.status)
-        } else {
-            text
-        });
-    }
-    Ok(text)
 }
 
 #[tauri::command]
@@ -195,29 +246,14 @@ fn default_browser_status() -> Option<bool> {
         if value.is_empty() {
             return Some(false);
         }
-        Some(value == "porter.desktop")
+        // Packaged builds register as `Porter.desktop`, the install script
+        // writes a user-level `porter.desktop`.
+        Some(value.to_lowercase().ends_with("porter.desktop"))
     }
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("defaults")
-            .args([
-                "read",
-                "com.apple.LaunchServices",
-                "LSSetDefaultHandlerForURLScheme",
-                "https",
-            ])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return Some(false);
-        }
-        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if value.is_empty() {
-            return Some(false);
-        }
-        let exe = std::env::current_exe().ok()?;
-        let exe = exe.canonicalize().unwrap_or(exe);
-        Some(value == exe.to_string_lossy())
+        let current = macos_default::current_default("https")?;
+        Some(current == macos_default::BUNDLE_ID)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -245,7 +281,7 @@ fn save_preset(
         browser_id,
         profile: profile.filter(|value| !value.trim().is_empty()),
     };
-    let mut store = state.store.lock().expect("store");
+    let mut store = lock(&state.store);
     if !store.browsers.iter().any(|browser| browser.id == preset.browser_id) {
         return Err("Pick a browser first".into());
     }
@@ -256,7 +292,7 @@ fn save_preset(
 
 #[tauri::command]
 fn delete_preset(state: State<AppState>, id: String) -> Result<(), String> {
-    let mut store = state.store.lock().expect("store");
+    let mut store = lock(&state.store);
     store.presets.retain(|preset| preset.id != id);
     save(&state.path, &store)
 }
@@ -268,7 +304,7 @@ fn launch_url(
     profile: Option<String>,
     url: String,
 ) -> Result<(), String> {
-    let store = state.store.lock().expect("store");
+    let store = lock(&state.store);
     if let Some(route) = find_route(&store.presets, &url) {
         let browser = store
             .browsers
@@ -287,7 +323,7 @@ fn launch_url(
 
 #[tauri::command]
 fn launch_preset(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
-    let store = state.store.lock().expect("store");
+    let store = lock(&state.store);
     let preset = store
         .presets
         .iter()
@@ -366,12 +402,20 @@ fn toggle_panel(window: &WebviewWindow) {
     let _ = window.set_focus();
 }
 
+/// Stores an incoming URL and asks the panel to handle it. Delivery channels
+/// can overlap (command line argument, single-instance forward, macOS
+/// AppleEvent), so a URL still waiting to be launched is only handled once.
 fn receive_url(app: &AppHandle, url: String) {
-    app.state::<AppState>()
-        .pending_url
-        .lock()
-        .expect("pending_url")
-        .replace(url.clone());
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    {
+        let mut pending = lock(&state.pending_url);
+        if pending.as_deref() == Some(url.as_str()) {
+            return;
+        }
+        *pending = Some(url.clone());
+    }
     let _ = app.emit("open-url", url);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -381,13 +425,12 @@ fn receive_url(app: &AppHandle, url: String) {
 
 #[tauri::command]
 fn take_pending_url(state: State<AppState>) -> Option<String> {
-    state.pending_url.lock().expect("pending_url").take()
+    lock(&state.pending_url).take()
 }
 
 struct LaunchChoice {
     browser: Browser,
     profile: Option<String>,
-    route_label: Option<String>,
 }
 
 fn resolve_launch(
@@ -405,7 +448,6 @@ fn resolve_launch(
         return Some(LaunchChoice {
             browser: browser.clone(),
             profile: route.profile.clone().or(picked_profile),
-            route_label: Some(route.label.clone()),
         });
     }
     if let Some(default_id) = store
@@ -417,7 +459,6 @@ fn resolve_launch(
             return Some(LaunchChoice {
                 browser: browser.clone(),
                 profile: store.default_profile.clone().or(picked_profile),
-                route_label: None,
             });
         }
     }
@@ -428,7 +469,6 @@ fn resolve_launch(
         .map(|browser| LaunchChoice {
             browser: browser.clone(),
             profile: picked_profile,
-            route_label: None,
         })
 }
 
@@ -443,38 +483,18 @@ fn auto_launch_url(
     if url.is_empty() {
         return Err("No pending URL".into());
     }
-    state.pending_url.lock().expect("pending_url").take();
-    let store = state.store.lock().expect("store");
+    lock(&state.pending_url).take();
+    let store = lock(&state.store);
     let choice = resolve_launch(&store, &url, browser_id, profile).ok_or("No browser selected")?;
     drop(store);
-
-    eprintln!(
-        "[auto_launch] url={} route={} browser={} profile={:?}",
-        url,
-        choice.route_label.as_deref().unwrap_or("-"),
-        choice.browser.name,
-        choice.profile
-    );
-    let result = launch(&choice.browser, choice.profile.as_deref(), &url);
-    eprintln!("[auto_launch] result={:?}", result);
-    result
+    launch(&choice.browser, choice.profile.as_deref(), &url)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            if let Some(url) = argv
-                .iter()
-                .find(|arg| {
-                    arg.starts_with("http://")
-                        || arg.starts_with("https://")
-                        || arg.starts_with("github:")
-                        || arg.starts_with("github://")
-                        || arg.starts_with("gh:")
-                        || arg.starts_with("gh://")
-                })
-            {
+            if let Some(url) = argv.iter().find(|arg| is_url_arg(arg)) {
                 receive_url(app, url.clone());
             }
         }))
@@ -490,7 +510,7 @@ pub fn run() {
             app.manage(AppState {
                 path,
                 store: Mutex::new(store),
-                pending_url: Mutex::new(pending_url.clone()),
+                pending_url: Mutex::new(None),
             });
 
             let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
@@ -551,9 +571,26 @@ pub fn run() {
             take_pending_url,
             auto_launch_url,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running porter");
+        .build(tauri::generate_context!())
+        .expect("error while building porter");
+    app.run(|app, event| {
+        receive_opened_urls(app, event);
+    });
 }
+
+/// macOS delivers default-browser URLs through an AppleEvent instead of
+/// command line arguments, surfacing them as `RunEvent::Opened`.
+#[cfg(target_os = "macos")]
+fn receive_opened_urls(app: &AppHandle, event: tauri::RunEvent) {
+    if let tauri::RunEvent::Opened { urls } = event {
+        for url in urls {
+            receive_url(app, url.to_string());
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn receive_opened_urls(_app: &AppHandle, _event: tauri::RunEvent) {}
 #[cfg(test)]
 mod route_tests {
     use super::*;
@@ -636,7 +673,6 @@ mod route_tests {
             .expect("a browser");
         assert_eq!(choice.browser.id, "b2");
         assert_eq!(choice.profile.as_deref(), Some("work"));
-        assert!(choice.route_label.is_none());
     }
 
     #[test]
@@ -660,7 +696,6 @@ mod route_tests {
         )
         .expect("a browser");
         assert_eq!(choice.browser.id, "b1");
-        assert_eq!(choice.route_label.as_deref(), Some("GitLab"));
     }
 
     #[test]
@@ -672,7 +707,6 @@ mod route_tests {
         let choice = resolve_launch(&store, "https://example.com", Some("b2".into()), None)
             .expect("a browser");
         assert_eq!(choice.browser.id, "b2");
-        assert!(choice.route_label.is_none());
     }
 
     #[test]
@@ -690,7 +724,18 @@ mod route_tests {
 
     #[test]
     fn finds_install_script() {
-        let script = find_install_script().expect("install-default-browser.sh should be found");
+        let script =
+            find_install_script_from(None).expect("install-default-browser.sh should be found");
         assert!(script.ends_with("install-default-browser.sh"));
+    }
+
+    #[test]
+    fn recognizes_url_arguments() {
+        assert!(is_url_arg("https://example.com"));
+        assert!(is_url_arg("http://example.com"));
+        assert!(is_url_arg("github:user/repo"));
+        assert!(is_url_arg("gh://user/repo"));
+        assert!(!is_url_arg("--verbose"));
+        assert!(!is_url_arg("file:///etc/passwd"));
     }
 }

@@ -34,18 +34,14 @@ pub struct LaunchPlan {
 
 pub fn validate_url(url: &str) -> Result<(), String> {
     let url = url.trim();
-    let normalized = if url.starts_with("github:") {
-        let rest = url[7..].trim_start_matches('/');
-        format!("https://github.com/{}", rest)
-    } else if url.starts_with("github://") {
-        let rest = url[9..].trim_start_matches('/');
-        format!("https://github.com/{}", rest)
-    } else if url.starts_with("gh:") {
-        let rest = url[3..].trim_start_matches('/');
-        format!("https://github.com/{}", rest)
-    } else if url.starts_with("gh://") {
-        let rest = url[5..].trim_start_matches('/');
-        format!("https://github.com/{}", rest)
+    let normalized = if let Some(rest) = url.strip_prefix("github://") {
+        format!("https://github.com/{}", rest.trim_start_matches('/'))
+    } else if let Some(rest) = url.strip_prefix("github:") {
+        format!("https://github.com/{}", rest.trim_start_matches('/'))
+    } else if let Some(rest) = url.strip_prefix("gh://") {
+        format!("https://github.com/{}", rest.trim_start_matches('/'))
+    } else if let Some(rest) = url.strip_prefix("gh:") {
+        format!("https://github.com/{}", rest.trim_start_matches('/'))
     } else {
         url.to_string()
     };
@@ -309,7 +305,7 @@ fn chromium_profiles(dir: &Path) -> Vec<Profile> {
                             .to_string(),
                     })
                     .collect();
-                profiles.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                profiles.sort_by_key(|profile| profile.name.to_lowercase());
                 if !profiles.is_empty() {
                     return profiles;
                 }

@@ -30,11 +30,30 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "../install-default-browser.sh": "install-default-browser.sh",
+      "icons/32x32.png": "porter-icon.png"
+    },
+    "linux": {
+      "deb": {
+        "desktopTemplate": "porter.desktop.template"
+      },
+      "rpm": {
+        "desktopTemplate": "porter.desktop.template"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/icon.png",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["http", "https"]
+      }
+    }
   }
 }
