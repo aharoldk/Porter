@@ -1,0 +1,77 @@
+name: prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      description:
+        description: "Release description (Markdown). Defaults to generated notes."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Bump version, commit, and tag
+        id: release
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+
+          current=$(jq -r .version package.json)
+          base="${current%%-*}"
+          IFS=. read -r major minor patch <<<"$base"
+          case "$BUMP" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            # An rc in the working tree means the candidate is ready: promote it
+            # to its base version instead of skipping past it.
+            patch) [[ "$current" == *-rc.* ]] || patch=$((patch + 1)) ;;
+            *) echo "unknown bump: $BUMP" >&2; exit 1 ;;
+          esac
+          next="$major.$minor.$patch"
+          tag="v$next"
+
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "tag $tag already exists" >&2
+            exit 1
+          fi
+
+          node .github/scripts/apply-version.mjs "$next"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+          git commit -m "Release $tag"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin HEAD:main
+          git push origin "$tag"
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Tagged $tag. The release workflow builds it."
+
+      # GITHUB_TOKEN-created tag pushes do not trigger other workflows, so the
+      # release build is dispatched explicitly. workflow_dispatch is exempt.
+      - name: Trigger the release build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DESCRIPTION: ${{ inputs.description }}
+        run: gh workflow run release.yml -f "tag=${{ steps.release.outputs.tag }}" -f "description=$DESCRIPTION"

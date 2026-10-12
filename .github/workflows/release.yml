@@ -1,0 +1,149 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, e.g. v0.1.2"
+        required: true
+        type: string
+      description:
+        description: "Release description (Markdown). Defaults to generated notes."
+        required: false
+        type: string
+
+jobs:
+  publish:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # The pushed tag (or dispatch input) names the version. Injecting it here
+      # means release candidates never leave a version commit behind.
+      - name: Resolve version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "invalid version: $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Apply the build version
+        shell: bash
+        run: node .github/scripts/apply-version.mjs "${{ steps.release.outputs.version }}"
+
+      # Ad-hoc signature so Apple Silicon treats GitHub downloads as signed.
+      # Replace with a Developer ID cert (APPLE_CERTIFICATE secrets) to notarize.
+      - name: Ad-hoc sign macOS builds
+        if: matrix.os == 'macos-latest'
+        run: echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+
+      - name: Build app
+        shell: bash
+        run: npm run build:app -- --target ${{ matrix.target }}
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          mkdir -p dist
+          find "src-tauri/target/${{ matrix.target }}/release/bundle" -type f \
+            \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.msi' -o -name '*.exe' -o -name '*.zip' \) \
+            -exec cp {} dist/ \;
+          ls -lh dist
+
+      - name: Upload assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DESCRIPTION: ${{ inputs.description }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          prerelease=()
+          if [[ "$tag" == *-rc.* ]]; then
+            prerelease=(--prerelease)
+          fi
+          if [[ -n "$DESCRIPTION" ]]; then
+            notes=(--notes "$DESCRIPTION")
+          else
+            notes=(--generate-notes)
+          fi
+          # GITHUB_ENV is per job, so every matrix leg must resolve the tag
+          # and create the draft itself. Concurrent creates race; retry.
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            if gh release view "$tag" >/dev/null 2>&1; then
+              break
+            fi
+            if gh release create "$tag" \
+              --draft \
+              "${prerelease[@]}" \
+              --title "Porter $tag" \
+              "${notes[@]}"; then
+              break
+            fi
+            sleep 10
+          done
+          gh release view "$tag"
+          gh release upload "$tag" dist/* --clobber
+
+  # Matrix legs always create a draft so uploads can finish first.
+  # Stable tags publish their draft once every leg succeeds; release candidates
+  # stay drafts.
+  publish-release:
+    needs: publish
+    if: ${{ !contains(inputs.tag || github.ref_name, '-rc.') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish stable release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ inputs.tag || github.ref_name }}" --repo "${{ github.repository }}" --draft=false
