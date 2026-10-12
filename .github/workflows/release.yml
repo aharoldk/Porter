@@ -123,9 +123,9 @@ jobs:
             fi
             if gh release create "$tag" \
               --draft \
-              "${prerelease[@]}" \
+              ${prerelease[@]+"${prerelease[@]}"} \
               --title "Porter $tag" \
-              "${notes[@]}"; then
+              ${notes[@]+"${notes[@]}"}; then
               break
             fi
             sleep 10
